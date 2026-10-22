@@ -1,0 +1,148 @@
+name: evm
+
+# ---------- Shared settings (DRY) ----------
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  init: true                       # proper PID 1, clean signal handling
+  read_only: true                  # immutable container filesystem
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  mem_limit: 256m
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-jwt: &jwt
+  JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in the root .env file}
+
+services:
+  # ---------- Database (local Mongo; set *_MONGO_URI in .env to use Atlas instead) ----------
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ---------- Common services ----------
+  registration-service:
+    <<: *service-defaults
+    build: ./registration-service
+    image: evm/registration-service:1.0.0
+    environment:
+      <<: *jwt
+      PORT: 3001
+      MONGO_URI: ${AUTH_MONGO_URI:-mongodb://mongo:27017/evm_auth}
+      ADMIN_CODE: ${ADMIN_CODE:?Set ADMIN_CODE in the root .env file}
+    depends_on:
+      mongo:
+        condition: service_healthy
+    networks: [backend]
+
+  login-service:
+    <<: *service-defaults
+    build: ./login-service
+    image: evm/login-service:1.0.0
+    environment:
+      <<: *jwt
+      PORT: 3002
+      JWT_EXPIRES_IN: 2h
+      MONGO_URI: ${AUTH_MONGO_URI:-mongodb://mongo:27017/evm_auth}
+    depends_on:
+      mongo:
+        condition: service_healthy
+    networks: [backend]
+
+  # ---------- My services ----------
+  # Two replicas of the Event Service so the gateway round-robin can be demonstrated
+  event-service-1:
+    <<: *service-defaults
+    build: ./event-service
+    image: evm/event-service:1.0.0
+    environment:
+      <<: *jwt
+      PORT: 3003
+      INSTANCE_NAME: event-1
+      MONGO_URI: ${EVENTS_MONGO_URI:-mongodb://mongo:27017/evm_events}
+    depends_on:
+      mongo:
+        condition: service_healthy
+    networks: [backend]
+
+  event-service-2:
+    <<: *service-defaults
+    image: evm/event-service:1.0.0     # same image, built once by event-service-1
+    environment:
+      <<: *jwt
+      PORT: 3003
+      INSTANCE_NAME: event-2
+      MONGO_URI: ${EVENTS_MONGO_URI:-mongodb://mongo:27017/evm_events}
+    depends_on:
+      mongo:
+        condition: service_healthy
+      event-service-1:
+        condition: service_healthy
+    networks: [backend]
+
+  assignment-service:
+    <<: *service-defaults
+    build: ./assignment-service
+    image: evm/assignment-service:1.0.0
+    environment:
+      <<: *jwt
+      PORT: 3006
+      MONGO_URI: ${ASSIGNMENTS_MONGO_URI:-mongodb://mongo:27017/evm_assignments}
+      # Service-to-service call: Compose DNS name instead of an EC2 private IP
+      EVENT_SERVICE_URL: http://event-service-1:3003
+    depends_on:
+      mongo:
+        condition: service_healthy
+      event-service-1:
+        condition: service_healthy
+    networks: [backend]
+
+  # ---------- Single public entry point ----------
+  api-gateway:
+    <<: *service-defaults
+    build: ./api-gateway
+    image: evm/api-gateway:1.0.0
+    ports:
+      - "3000:3000"                # the ONLY published port
+    environment:
+      <<: *jwt
+      PORT: 3000
+      REGISTRATION_SERVICE_URL: http://registration-service:3001
+      LOGIN_SERVICE_URL: http://login-service:3002
+      EVENT_SERVICE_URLS: http://event-service-1:3003,http://event-service-2:3003
+      ASSIGNMENT_SERVICE_URL: http://assignment-service:3006
+    depends_on:
+      registration-service:
+        condition: service_healthy
+      login-service:
+        condition: service_healthy
+      event-service-1:
+        condition: service_healthy
+      event-service-2:
+        condition: service_healthy
+      assignment-service:
+        condition: service_healthy
+    networks: [frontend, backend]
+
+networks:
+  frontend:      # gateway <-> outside world
+  backend:       # services <-> database, not reachable from outside
+
+volumes:
+  mongo-data:
